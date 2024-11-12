@@ -9,6 +9,7 @@
 # 27/06/2017   : Add funtion insertlog , update job status , edit Function UpdateParameter  By Amphai S.
 # [3]: 18/10/2017 : By Pakawadee S. : Fix bug subport search date of file include numeric [5.3.2.2 Check Row/Size of DAT File : DATE_CHECK]    
 # [4]: 28/04/2020 : By Sho H. : Fix REC_CODE = 8 does not return error to control-m
+# [5]: xx/11/2024 : By Budsakorn W. : Support FILE_CHECK = L (list .dat) and X (have not .sync)
 #################################################################################
 
 ############# 1.Globals Config ############# 
@@ -362,6 +363,720 @@ if [ ${VER_PARA} == "N" ]; then
 	UpdateParameter "$VER_PARA|$DATE_FROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE" 
 fi
 }
+##END Function VerifyParameter
+
+PrepareFileAndLoad(){
+	if [ $DELAY_FLG == "N" ]; then
+		LOG_MESSAGE="CHECK DATE FILE ... "
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+		#DATE_CHECK=$(echo ${FILE_FOR_SQL} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
+					DATE_CHECK=$(echo ${FILE_FOR_SQL} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')
+		LOG_MESSAGE="DATE_CHECK ... "${DATE_CHECK}
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+		##First row
+		if [ -z "$DATE_COUNT" ];then 
+			if [ $GET_FILE == "F" ]; then
+				DATE_COUNT=$DATE_CHECK
+			else
+				DATE_COUNT=$V_DATEFROM
+			fi
+			
+			if [ $DATE_COUNT == $DATE_CHECK ]; then
+				LOG_MESSAGE="START DATE_COUNT ... "${DATE_COUNT}
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			else
+				LOG_MESSAGE="Some file missing ..."
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		
+				#LOG_MESSAGE="## The File Date : "${DATE_COUNT}" is missing ... "
+				#echo ${LOG_MESSAGE}
+				#echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+				JOB_RESULT_FLG="N"				
+				JOB_RESULT=4
+				DATA_SOURCE=$CURRENT_DATA
+				if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
+					V_DATEFROM=$DATE_COUNT
+				fi
+				UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+			fi
+		else
+			LOG_MESSAGE="DATE_COUNT ... "${DATE_COUNT}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+		fi
+
+		##RANG FILE 
+		## Command In Loop ##
+		sqlplus -s @${CM_USERID} ${DATE_CHECK} ${DATE_COUNT} > $DATA_TMP_FILE <<EOF
+		set echo off verify off feed off head off line 1000 pages 0
+		SELECT trim(to_date('&&1','yyyymmdd') - to_date('&&2','yyyymmdd'))
+		FROM dual;
+EOF
+
+		COUNT=`cat $DATA_TMP_FILE | awk '{print $1}'`	
+
+		if [ $COUNT -ge 2 ]; then
+			FILE_DATE_FLG="N"	
+			LOG_MESSAGE="##Some file missing ... "
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			## Command In Loop ##
+			sqlplus -s @${CM_USERID} ${PGM_ID} > $TMP_FILE <<EOF
+			set echo off verify off feed off head off line 1000 pages 0
+			SELECT to_char(t.date_count,'yyyymmdd')
+			FROM 
+			(SELECT nvl((SELECT to_date(substr(MAX(data_source), length(p.file_name)+1, 8), 'yyyymmdd') + 1
+											FROM cm_etl_log
+											WHERE job_name = p.job_name
+											AND substr(data_source,-4,4)=p.file_type
+											AND finish_date IS NOT NULL
+											), sysdate) date_count
+					FROM cm_etl_parameter p
+					WHERE p.job_name='&&1')t;
+EOF
+			DATE_COUNT=`cat $TMP_FILE | awk '{print $1}'`
+
+			LOG_MESSAGE="## The File Date : "${DATE_COUNT}" is missing ... "
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		else
+			DATE_COUNT=$DATE_CHECK
+			FILE_DATE_FLG="Y"
+			LOG_MESSAGE="DATE_COUNT ... "${DATE_COUNT}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		fi
+
+	else
+		FILE_DATE_FLG="Y"
+	fi 
+
+
+	#check Date Not Pass
+	if [ $FILE_DATE_FLG == "N" ]; then 
+		LOG_MESSAGE="Program : Some file missing ..."
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		JOB_RESULT_FLG="N"
+		JOB_RESULT=4
+		DATA_SOURCE=$CURRENT_DATA
+		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
+			V_DATEFROM=$DATE_COUNT
+		fi
+		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+	else	
+		### 5.4 Check Split File before Call PL	
+		if [ $SPLIT_FLG == "Y" ]; then
+			### 5.4.1 IF SPLIT_FLG = Y  ### 
+			LOG_MESSAGE="## SPLIT_FLG = Y .... "
+			echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			
+			### 5.4.1.1 Copy file for backup  ### 
+			LOG_MESSAGE="## Copy File: "${FILE_FOR_SQL}
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			cp ${FILE_FOR_SQL} ${DATA_BK_PATH}
+			LOG_MESSAGE="## Splitting File..."
+			# echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+			ls ${FILE_FOR_SQL} > $TMP_SPLIT
+			rows_split=`cat ${TMP_SPLIT}|wc -l|sed 's/ //g'`
+
+			num_split=1
+			while [ $num_split -le $rows_split ]
+			do
+				tail_row_split="tail +${num_split} ${TMP_SPLIT}"
+				$tail_row_split > $OUT_SPLIT
+
+				filename_split=`head -1 $OUT_SPLIT | cut -f1`
+				LOG_MESSAGE="Split File Name: "${filename_split}
+				echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+				split -l ${SPLIT_ROW} ${filename_split} ${filename_split}
+				rm ${filename_split}
+
+				let num_split=$num_split+1
+			done
+
+			### 5.4.1.2 Load File ## 
+			LOG_MESSAGE="## Loading File..."
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+			ls ${FILE_FOR_SQL}*|sort > $TMP_SPLIT
+			rows_split=`cat ${TMP_SPLIT}|wc -l|sed 's/ //g'`
+		
+
+			LOG_MESSAGE="Count Splitted File: "${rows_split}
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			
+			##Start Check Rows Split 	
+			if [ $rows_split -eq 0 ]; then
+				LOG_MESSAGE="Splitted file not found."
+				filename_split="NO"
+				JOB_RESULT_FLG="N"
+				JOB_RESULT=2
+				if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ] ; then					    
+					V_DATEFROM=DATE_COUNT		
+				fi
+				if [ $ALL_FILE_FLG_SPILT == "Y" ] && [ $ALL_FILE_FLG == "Y" ]; then
+					ALL_FILE_FLG="Y"
+				else
+					ALL_FILE_FLG="N"
+				fi		
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+			else 
+				num_split=1
+				while [ $num_split -le $rows_split ]
+				do
+					tail_row_split="tail +${num_split} ${TMP_SPLIT}"
+					$tail_row_split > $OUT_SPLIT
+					filename_split=`head -1 $OUT_SPLIT | cut -f1`
+					if [ $num_split -eq $rows_split ]; then
+					ALL_FILE_FLG_SPILT="Y"
+					else
+					ALL_FILE_FLG_SPILT="N"
+					fi
+					echo "ALL_FILE_FLG_SPILT : "$ALL_FILE_FLG_SPILT
+					echo "ALL_FILE_FLG : "$ALL_FILE_FLG	  
+					### 5.4.1.3 Check Log Datasource
+					if [ $DELAY_FLG == "N" ]; then
+						## Command In Loop ##
+						sqlplus -s @${CM_USERID} ${PGM_ID} ${filename_split} > $FILE_Y <<EOF
+						set echo off verify off feed off head off line 1000 pages 0
+						select 'Y'
+						from cm_etl_log l
+						where l.job_name='&&1'
+						and l.data_source='&&2'
+						and l.finish_date is not null
+						and rownum=1;
+EOF
+						rows_y=`cat ${FILE_Y}|wc -l|sed 's/ //g'`
+						if [ $rows_y -ne 0 ]; then
+							FILE_Y="Y"
+							LOG_MESSAGE="## File : "${filename_split}" is exists in log data source"
+							#echo ${LOG_MESSAGE}
+							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+
+						else
+							FILE_Y="N"
+							LOG_MESSAGE="## File : "${filename_split}" is not exists in log data source"
+							#echo ${LOG_MESSAGE}
+							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+						fi
+					else
+						FILE_Y="N"
+						LOG_MESSAGE="## This delay case don't check log data source"
+						#echo ${LOG_MESSAGE}
+						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+					fi  ###Check Log Datasource
+					
+					#FILE_Y NOT IN CM_ETL_LOG
+					if [ $FILE_Y == "N" ]; then					
+			
+						### 5.4.1.4 Execut Query ## 			  
+						LOG_MESSAGE="## Execute Query ... ["${num_split}"] : "${filename_split}
+						#echo ${LOG_MESSAGE}
+						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}   
+							
+						#DATE_FOR_SQL=$(echo ${filename_split} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
+												DATE_FOR_SQL=$(echo ${filename_split}	|awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')						  
+
+##Excute Process.sql In Loop ##
+						sqlplus -s @${CM_USERID} >> ${LOG_PATH}/${LOG_FILE} <<EOF
+						@${SCRIPT_PATH}/${SCRIPT_NAME} ${SPLIT_PATH} ${filename_split} ${DATE_FROM} ${DATE_TO} ${PGM_ID}
+						##${DATE_FOR_SQL}
+EOF
+						RESULT=$?;
+						## 5.4.1.5 Check Result ##
+						DATA_SOURCE=$filename_split
+						###V_DATEFROM=DATE_FROM
+						JOB_RESULT=""
+						ALL_FILE_FLG=""
+						if [ $ALL_FILE_FLG_SPILT == "Y" ] && [ $ALL_FILE_FLG == "Y" ]; then
+							ALL_FILE_FLG="Y"
+						else
+							ALL_FILE_FLG="N"
+						fi
+									
+						if [ $RESULT -eq 16 ]; then
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Execute Error / Data Error : Return ("${RESULT}")"
+							filename_split="NO"
+							JOB_RESULT=5
+						elif [ $RESULT -eq 4 ]; then
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Can not open data file : Return ("${RESULT}")"
+							filename_split="NO"
+							JOB_RESULT=5
+							JOB_RESULT_FLG="N"
+						## [4]
+						elif [ $RESULT -eq 8 ]; then
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Conflicted columns did not match with file : Return ("${RESULT}")"
+							filename_split="NO"
+							JOB_RESULT=6
+							JOB_RESULT_FLG="N"		
+						elif [ $RESULT -eq 10 ]; then
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Maintain Log Error : Return ("${RESULT}")"
+							JOB_RESULT=0
+							JOB_RESULT_FLG="Y"
+						elif [ $RESULT -eq 12 ]; then
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Check cm_etl_error : Return ("${RESULT}")"
+							filename_split="NO"
+							JOB_RESULT=0
+							JOB_RESULT_FLG="Y"
+						else
+							LOG_MESSAGE="## "${SCRIPT_NAME}" : Execute Completely : Return ("${RESULT}")"
+							JOB_RESULT=0
+							JOB_RESULT_FLG="Y"
+						fi;  
+						
+						if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
+							if [ $JOB_RESULT -eq 0 ]; then
+								V_DATEFROM=$DATE_CHECK	
+							else
+								V_DATEFROM=$DATE_COUNT
+								
+								UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"
+							fi
+						fi
+						
+						echo ${LOG_MESSAGE}
+						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+										
+					else
+						LOG_MESSAGE="## Skip file ..."
+						echo ${LOG_MESSAGE}
+						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+					fi 
+
+					let num_split=$num_split+1 	
+					
+				done 
+			fi
+			##End Check Rows Split 		
+							
+		fi ### END 5.4 Check Split File before Call PL	
+
+		if [ $SPLIT_FLG == "N" ]; then 	
+			### 5.4.2 IF SPLIT_FLG = N  ###	
+			LOG_MESSAGE="## SPLIT_FLG = N .... "
+			#echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+					
+			### 5.4.2.1 Check Log Datasource
+			if [ $DELAY_FLG == "N" ]; then
+				LOG_MESSAGE="Check Log Datasource ...."
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				## Command In Loop ##
+				sqlplus -s @${CM_USERID} ${PGM_ID} ${FILE_FOR_SQL} > $FILE_Y <<EOF
+				set echo off verify off feed off head off line 1000 pages 0
+				select 'Y'
+				from cm_etl_log l
+				where l.job_name='&&1'
+				and l.data_source='&&2'
+				and l.finish_date is not null
+				and rownum=1;
+EOF
+				rows_y=`cat ${FILE_Y}|wc -l|sed 's/ //g'`
+
+				if [ $rows_y -ne 0 ]; then
+					FILE_Y="Y"
+					LOG_MESSAGE="## File : "${FILE_FOR_SQL}" is exists in log data source"
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+
+				else
+					FILE_Y="N"
+					LOG_MESSAGE="## File : "${FILE_FOR_SQL}" is not exists in log data source"
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				fi
+
+			else
+				FILE_Y="N"
+				LOG_MESSAGE="## This delay case don't check log data source"
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			fi  ###Check Log Datasource
+					
+
+			if [ $FILE_Y == "N" ]; then			
+				### 5.4.2. IF Execute Query ###
+				LOG_MESSAGE="## Execute Query ... ["${num}"] : "${FILE_FOR_SQL}
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}  
+					
+				#DATE_FOR_SQL=$(echo ${FILE_FOR_SQL} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
+								DATE_FOR_SQL=$(echo ${FILE_FOR_SQL} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')					## Command In Loop ##
+				sqlplus -s @${CM_USERID} >> ${LOG_PATH}/${LOG_FILE} <<EOF
+				@${SCRIPT_PATH}/${SCRIPT_NAME} ${FILE_PATH} ${FILE_FOR_SQL} ${DATE_FOR_SQL} ${DATE_FOR_SQL} ${PGM_ID}
+				#${DATE_FOR_SQL}
+EOF
+				RESULT=$?;
+				## 5.4.2.2 Check Result ##
+
+				if [ $RESULT -eq 16 ]; then
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Error / Error : Return ("${RESULT}")"
+					JOB_RESULT=5
+					JOB_RESULT_FLG="N"
+				elif [ $RESULT -eq 4 ]; then
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Can not open data file : Return ("${RESULT}")"
+					JOB_RESULT=5
+					JOB_RESULT_FLG="N"	
+				## [4]
+				elif [ $RESULT -eq 8 ]; then
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Conflicted columns did not match with file : Return ("${RESULT}")"
+					JOB_RESULT=6
+					JOB_RESULT_FLG="N"
+				elif [ $RESULT -eq 10 ]; then
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Maintain Log Error : Return ("${RESULT}")"
+					FILE_FOR_SQL="NO"
+					JOB_RESULT=0
+					JOB_RESULT_FLG="Y"
+				elif [ $RESULT -eq 12 ]; then
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Check cm_etl_error : Return ("${RESULT}")"	
+					JOB_RESULT=0
+					JOB_RESULT_FLG="Y"
+				else
+					LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Completely : Return ("${RESULT}")"
+					JOB_RESULT=0
+					JOB_RESULT_FLG="Y"	
+				fi; 
+			
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}   
+
+				if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
+					if [ $RESULT -eq 0 ]; then
+						V_DATEFROM=$DATE_CHECK
+					else
+						V_DATEFROM=$DATE_COUNT
+						UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+					fi
+
+				fi
+						
+
+
+			else
+				LOG_MESSAGE="## Skip file ..."
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			fi
+				
+		fi  ##SPLIT FLG = N
+#### ploy			
+	fi	#END check Date Not Pass
+}
+##END Function PrepareFileAndLoad
+
+CheckFile(){
+		############# 5.2 Check Total File discover #############
+    if [ $DELAY_FLG == "N" ] || [ $DELAY_FLG == "D" ]; then
+		LOG_MESSAGE="Finding file...Date from : "${V_DATEFROM}" ...Date to : "${V_DATETO}" ..."		
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		ls ${FILE_NAME}*.*| awk '"'${FILE_NAME}'""'${V_DATEFROM}'" <= $1 {print $1}' | awk '"'${FILE_NAME}'""'${V_DATETO}'""_999999">= $1 {print $1}' |sort > $TMP_FILE  	
+	elif [ $DELAY_FLG == "F" ]; then
+	    # rechect .dat have command 
+		LAST_FILE_NAME=$(echo $LAST_FILE_NAME | cut -f 1 -d '.')
+		LOG_MESSAGE="Finding file... "${LAST_FILE_NAME}
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		ls ${LAST_FILE_NAME}|sort > $TMP_FILE 
+	else
+		LOG_MESSAGE="DELAY_FLG is not [F] or [D] or [N]."
+		#echo ${LOG_MESSAGE}
+		#echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		JOB_RESULT_FLG="N"
+		JOB_RESULT=1
+		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+	fi
+	
+	if [ $FILE_TYPE == ".dat" ]; then
+		if [ $FILE_CHECK == "X" ]; then
+			rowl=`cat ${TMP_FILE} |wc -l|sed 's/ //g'`	
+			DATA_SOURCE="$FILE_NAME$V_DATEFROM*.dat"	
+		else
+			ls ${FILE_NAME}*.sync| awk '"'${FILE_NAME}'""'${V_DATEFROM}'" <= $1 {print $1}' | awk '"'${FILE_NAME}'""'${V_DATETO}'""_999999">= $1 {print $1}' |sort > $LST_FILE  
+			rowl=`cat ${LST_FILE} |wc -l|sed 's/ //g'`
+	    	DATA_SOURCE="$FILE_NAME$V_DATEFROM*.sync"
+		fi	
+	else
+        rowl=`cat ${TMP_FILE} |wc -l|sed 's/ //g'`	
+		DATA_SOURCE="$FILE_NAME$V_DATEFROM*$FILE_TYPE"
+	fi
+
+	echo "data_source :"$DATA_SOURCE
+	echo ${LOG_MESSAGE}
+	echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+	
+	############# 5.2.2 Check Total File .sync #############
+	echo "file rows:"$rowl
+    if [ $rowl -eq 0 ]; then
+		
+		
+		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "F" ]; then
+			JOB_RESULT_FLG="Y"
+			JOB_RESULT=0
+			LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Completely : Return ("${RESULT}")"
+		else
+			if [ $FILE_TYPE == ".txt" ] || [ $FILE_TYPE == ".csv" ]; then
+				LOG_MESSAGE="File ${FILE_TYPE} not found."	
+			elif [ $FILE_TYPE == ".dat" ] && [ $FILE_CHECK == "X" ]; then
+				LOG_MESSAGE="File .dat not found."
+			else
+				LOG_MESSAGE="File .sync not found."	
+			fi	
+			JOB_RESULT_FLG="N"
+			JOB_RESULT=2
+		fi
+		
+		echo ${LOG_MESSAGE}
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+	else
+	    if [ $SPLIT_FLG == "Y" ]; then
+			LOG_MESSAGE="Total list file data = "${rowl}
+			echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+	
+			#### 5.2.1.1 Copy File and Change Permission #####
+			LOG_MESSAGE="Copy File To: ("${SPLIT_PATH}")"
+			echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+
+			cp `cat ${TMP_FILE}` ${SPLIT_PATH} 
+			cd ${SPLIT_PATH}
+			chmod 777 `cat ${TMP_FILE}`
+			
+		else
+			LOG_MESSAGE="Total list file data = "${rowl}
+			echo ${LOG_MESSAGE}
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		fi
+    fi
+
+	############# 5.3 Check File .txt OR .csv OR .dat/.sync #############
+	LOG_MESSAGE="## Check File..."
+	echo ${LOG_MESSAGE}
+	echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+	## Start Loop Check
+	num=1
+	
+	while [ $num -le $rowl ]
+	do  
+		if [ $FILE_TYPE == ".txt" ] || [ $FILE_TYPE == ".csv" ]; then	
+			tail_row="tail +${num} ${TMP_FILE}"
+			$tail_row > $OUT_FILE
+		elif [ $FILE_TYPE == ".dat" ] && [ $FILE_CHECK == "X" ]; then
+			tail_row="tail +${num} ${TMP_FILE}"
+			$tail_row > $OUT_FILE
+		else  
+			tail_row="tail +${num} ${LST_FILE}"
+			$tail_row > $OUT_FILE
+		fi   
+		
+   	    CURRENT_DATA=`head -1 $OUT_FILE | cut -f1`
+      	DATA_SOURCE=$CURRENT_DATA
+
+		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
+			#V_DATEFROM=$(echo ${CURRENT_DATA} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
+            V_DATEFROM=$(echo ${CURRENT_DATA} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')
+		fi
+		
+		if [ $num -eq $rowl ]; then
+			ALL_FILE_FLG="Y"
+		else
+			ALL_FILE_FLG="N"
+		fi
+	
+		LOG_MESSAGE="######################### File number ["${num}"]:["${CURRENT_DATA}"] #########################"
+		echo ${LOG_MESSAGE}
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+	  
+		if [ $FILE_TYPE == ".txt" ] || [ $FILE_TYPE == ".csv" ]; then	
+			############# 5.3.1 Check File .txt or .csv #############
+			LOG_MESSAGE="## File ${FILE_TYPE} : ${CURRENT_DATA} ..."
+			FILE_FOR_SQL=${CURRENT_DATA}		
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			
+			echo "File: "${FILE_FOR_SQL}
+			PrepareFileAndLoad
+		
+		elif [ $FILE_TYPE == ".dat" ] && [ $FILE_CHECK == "X" ]; then
+			############# 5.3.2 Check File .dat and  in have not .sync #############
+			LOG_MESSAGE="## File .dat : "${CURRENT_DATA}" ..."
+			FILE_FOR_SQL=${CURRENT_DATA}		
+			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+			
+			echo "File: "${FILE_FOR_SQL}
+			PrepareFileAndLoad
+		else
+			############# 5.3.3 Check File .dat/.sync #############
+			if [ $FILE_CHECK == "L" ]; then
+				##while IFS= read -r SYNC_FILE_NAME; do
+					##SYNC_FILE="$FILE_PATH/$SYNC_FILE_NAME"
+					##if [ -f "$SYNC_FILE" ]; then
+						##echo "Processing .sync file: $SYNC_FILE"
+						##LOG_MESSAGE="## Check Data : list file .dat ..."${CURRENT_DATA}
+						##echo ${LOG_MESSAGE}
+						##echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+						#########
+						while IFS= read -r DAT_FILE_NAME; do
+							DAT_FILE=$DAT_FILE_NAME
+							if [ -f "$DAT_FILE" ]; then
+								LOG_MESSAGE="## check list .dat File found: ${DAT_FILE} ..."
+								echo ${LOG_MESSAGE}
+								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+								
+								LOG_MESSAGE="## File ${FILE_TYPE} : ${DAT_FILE} ..."
+								FILE_FOR_SQL=${DAT_FILE}		
+								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+								
+								echo "File: "${FILE_FOR_SQL}
+								PrepareFileAndLoad
+							else
+								LOG_MESSAGE="## check list .dat File not found: ${DAT_FILE} ..."
+								echo ${LOG_MESSAGE}
+								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+								LOG_MESSAGE="File .dat not found."
+								echo ${LOG_MESSAGE}
+								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+								JOB_RESULT_FLG="N"
+								JOB_RESULT=2
+								UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"
+							fi
+						done < "$CURRENT_DATA"
+					##else
+						##LOG_MESSAGE="## .sync File not found: ${SYNC_FILE} ..."
+						##echo "${LOG_MESSAGE}" >> "$LOG_PATH/$LOG_FILE"
+					##fi
+				##done < "$TMP_FILE"
+
+			else
+			##### case .dat/.sync in case FILE CHECK row or size #####
+				LOG_MESSAGE="## Check Data : file .sync ..."${CURRENT_DATA}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				cat ${CURRENT_DATA} > ${TMP_CHK}
+
+				DAT_FILE_NAME=`cat ${CURRENT_DATA}|nawk -F"|" '{print $1}' `
+				SYNC_ROW_SIZE=`cat ${CURRENT_DATA}|nawk -F"|" '{print $2}' `
+				SYNC_DATA=`cat ${CURRENT_DATA} `
+				echo "DAT_FILE_NAME : "${DAT_FILE_NAME}
+				echo "SYNC_ROW_SIZE : "${SYNC_ROW_SIZE}
+				
+				if [ -z ${SYNC_DATA} ]; then
+					JOB_RESULT_FLG="N"
+					JOB_RESULT=3
+					LOG_MESSAGE="No data in file .sync"
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}				
+					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+				fi
+					
+				LOG_MESSAGE="## Check Name File .sync and Data Name file .dat in .sync file"
+				
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				
+				chk_s=${CURRENT_DATA%%.*}
+				chk_d=${DAT_FILE_NAME%%.*}
+				LOG_MESSAGE="Name File .sync : "${chk_s}
+				
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				LOG_MESSAGE="Data Name file .dat in .sync file : "${chk_d}
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				
+			
+				if [ $chk_s == $chk_d ]; then
+					LOG_MESSAGE="Name File .sync == Data Name file .dat in .sync file"	
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				else
+					LOG_MESSAGE="Name File .sync <> Data Name file .dat in .sync file"
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	  
+					JOB_RESULT_FLG="N"
+					JOB_RESULT=3
+					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"		
+				fi
+				
+				
+				LOG_MESSAGE="## File .sync : Finding ..."${DAT_FILE_NAME}" : Size or Row ..."${SYNC_ROW_SIZE}
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+					
+				##### 5.3.2.1 find .dat #####
+				echo "----------------------------------"$DAT_FILE_NAME
+				
+				ls ${DAT_FILE_NAME} > $LST_CHK
+				row_d=`cat ${LST_CHK} |wc -l|sed 's/ //g'`
+
+				DATA_SOURCE=${DAT_FILE_NAME}
+
+				if [ $row_d -eq 0 ]; then
+					LOG_MESSAGE="File .dat not found."
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
+					JOB_RESULT_FLG="N"
+					JOB_RESULT=2
+					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+				else
+					LOG_MESSAGE="Total list file .dat = "${row_d}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+					#echo ${LOG_MESSAGE}
+				fi
+
+				
+				##### 5.3.2.2 Check Row/Size of DAT File #####			
+				if [ $FILE_CHECK == "R" ]; then
+					DAT_ROW_SIZE=`cat ${DAT_FILE_NAME} |wc -l|sed 's/ //g'`
+					DAT_ROW_SIZE=$(($DAT_ROW_SIZE))
+				else
+					DAT_ROW_SIZE=`ls -l ${DAT_FILE_NAME} | awk '{ print $5}'`
+				fi
+				
+				LOG_MESSAGE="File .dat ["${num}"] : "${DAT_FILE_NAME}" | Size or Row : "${DAT_ROW_SIZE}
+				#echo ${LOG_MESSAGE}
+				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+				
+				if [ $SYNC_ROW_SIZE -ne $DAT_ROW_SIZE ]; then
+					LOG_MESSAGE="Data file .dat/.sync is wrong row or size."
+					#echo ${LOG_MESSAGE}
+					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}		
+					JOB_RESULT_FLG="N"
+					JOB_RESULT=3
+					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
+				else
+					FILE_FOR_SQL=${DAT_FILE_NAME}	
+					##UPD_LAST_FILE_NAME=${DAT_FILE_NAME}
+					echo "File: "${FILE_FOR_SQL}
+					PrepareFileAndLoad				
+				fi
+			fi			
+					
+		fi ###CHK TXT DAT
+
+#######END Validate File JOB_RESULT = 2, 3################
+
+
+	if [ $JOB_RESULT_FLG == "Y" ]; then
+		UPD_LAST_FILE_NAME=${FILE_FOR_SQL}	
+	fi
+ 	
+ 
+let num=$num+1
+done	
+}
+##END Function CheckFile
+
 ############# 3. Start Process #############
 LOG_MESSAGE="==================== START TIME "`date +%d/%m/%Y_%H:%M:%S`" ====================="
 echo ${LOG_MESSAGE}
@@ -736,12 +1451,12 @@ if [ -n "${FILE_TYPE}" ]; then
 					  VER_PARA="N"
 					  VerifyParameter
 				fi
-		elif [ $FILE_TYPE == ".txt" ]; then
-			LOG_MESSAGE="File type : .txt is not use FILE_CHECK"
+		elif [ $FILE_TYPE == ".txt" ] || [ $FILE_TYPE == ".csv" ]; then
+			LOG_MESSAGE="File type : ${FILE_TYPE} is not use FILE_CHECK"
 			echo ${LOG_MESSAGE}
 			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
 		else
-			LOG_MESSAGE="FILE_TYPE is not [.txt] or [.dat]."
+			LOG_MESSAGE="FILE_TYPE is not [.txt] or [.dat]. or [.csv]"
 			echo ${LOG_MESSAGE}
 			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
 			VER_PARA="N"
@@ -863,6 +1578,9 @@ LOG_MESSAGE="##Processing..."
 echo ${LOG_MESSAGE}
 echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
 
+if [ $SUBFOLDER_FLG == "Y" ]; then
+
+
 
 ############# 5.0 Loop Sup Folder #############
 ## Command List Sub Folder ##
@@ -906,13 +1624,10 @@ do
 	DATE_COUNT=""
 	DATA_SOURCE=""
 	
-	############# 5.1 Find File Folder #############
-	if [ $SUBFOLDER_FLG == "Y" ]; then
-		FILE_PATH=$MFILE_PATH/$SUBFOLDER
-	else
-		FILE_PATH=${MFILE_PATH}/${SUBFOLDER}
-	fi
-	
+
+	FILE_PATH=$MFILE_PATH/$SUBFOLDER
+
+
 	if [ ! -d "$FILE_PATH" ]; then
 		LOG_MESSAGE="File Path Not found [ $FILE_PATH ]"
 		JOB_RESULT_FLG="N"
@@ -933,644 +1648,36 @@ do
 	echo "SUBFOLDER :"$SUBFOLDER
 	echo "FILE PATH :"${FILE_PATH}
 	cd ${FILE_PATH}
-
-	############# 5.2 Check Total File discover #############
-    if [ $DELAY_FLG == "N" ] || [ $DELAY_FLG == "D" ]; then
-		LOG_MESSAGE="Finding file...Date from : "${V_DATEFROM}" ...Date to : "${V_DATETO}" ..."		
-		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		ls ${FILE_NAME}*.*| awk '"'${FILE_NAME}'""'${V_DATEFROM}'" <= $1 {print $1}' | awk '"'${FILE_NAME}'""'${V_DATETO}'""_999999">= $1 {print $1}' |sort > $TMP_FILE  	
-	elif [ $DELAY_FLG == "F" ]; then
-	    # rechect .dat have command 
-		LAST_FILE_NAME=$(echo $LAST_FILE_NAME | cut -f 1 -d '.')
-		LOG_MESSAGE="Finding file... "${LAST_FILE_NAME}
-		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		ls ${LAST_FILE_NAME}|sort > $TMP_FILE 
-	else
-		LOG_MESSAGE="DELAY_FLG is not [F] or [D] or [N]."
-		#echo ${LOG_MESSAGE}
-		#echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		JOB_RESULT_FLG="N"
-		JOB_RESULT=1
-		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-	fi
+	CheckFile
 	
-	if [ $FILE_TYPE != ".txt" ]; then
-		ls ${FILE_NAME}*.sync| awk '"'${FILE_NAME}'""'${V_DATEFROM}'" <= $1 {print $1}' | awk '"'${FILE_NAME}'""'${V_DATETO}'""_999999">= $1 {print $1}' |sort > $LST_FILE  
-		rowl=`cat ${LST_FILE} |wc -l|sed 's/ //g'`
-	    DATA_SOURCE="$FILE_NAME$V_DATEFROM*.sync"
-    else
-        rowl=`cat ${TMP_FILE} |wc -l|sed 's/ //g'`	
-		DATA_SOURCE="$FILE_NAME$V_DATEFROM*.txt"
-	fi
-	echo "data_source :"$DATA_SOURCE
-	echo ${LOG_MESSAGE}
-	echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-	
-	############# 5.2.2 Check Total File .sync #############
-	echo "file rows:"$rowl
-    if [ $rowl -eq 0 ]; then
-		
-		
-		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "F" ]; then
-			JOB_RESULT_FLG="Y"
-			JOB_RESULT=0
-			LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Completely : Return ("${RESULT}")"
-		else
-			if [ $FILE_TYPE == ".txt" ]; then
-				LOG_MESSAGE="File .txt not found."	
-			else
-				LOG_MESSAGE="File .sync not found."	
-			fi	
-			JOB_RESULT_FLG="N"
-			JOB_RESULT=2
-		fi
-		
-		echo ${LOG_MESSAGE}
-		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-	else
-	    if [ $SPLIT_FLG == "Y" ]; then
-			LOG_MESSAGE="Total list file data = "${rowl}
-			echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-	
-			#### 5.2.1.1 Copy File and Change Permission #####
-			LOG_MESSAGE="Copy File To: ("${SPLIT_PATH}")"
-			echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
 
-			cp `cat ${TMP_FILE}` ${SPLIT_PATH} 
-			cd ${SPLIT_PATH}
-			chmod 777 `cat ${TMP_FILE}`
-			
-		else
-			LOG_MESSAGE="Total list file data = "${rowl}
-			echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		fi
-    fi
-
-	############# 5.3 Check File .txt OR .dat/.sync #############
-	LOG_MESSAGE="## Check File..."
-	echo ${LOG_MESSAGE}
-	echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-	## Start Loop Check
-	num=1
-	
-	while [ $num -le $rowl ]
-	do  
-		if [ $FILE_TYPE == ".txt" ]; then	
-			tail_row="tail +${num} ${TMP_FILE}"
-			$tail_row > $OUT_FILE
-		else  
-			tail_row="tail +${num} ${LST_FILE}"
-			$tail_row > $OUT_FILE
-		fi   
-		
-   	    CURRENT_DATA=`head -1 $OUT_FILE | cut -f1`
-      	DATA_SOURCE=$CURRENT_DATA
-		
-		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
-			#V_DATEFROM=$(echo ${CURRENT_DATA} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
-                     V_DATEFROM=$(echo ${CURRENT_DATA} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')
-		fi
-		
-		if [ $num -eq $rowl ]; then
-			ALL_FILE_FLG="Y"
-		else
-			ALL_FILE_FLG="N"
-		fi
-	
-		LOG_MESSAGE="######################### File number ["${num}"]:["${CURRENT_DATA}"] #########################"
-		echo ${LOG_MESSAGE}
-		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-	  
-		if [ $FILE_TYPE == ".txt" ]; then	
-			############# 5.3.1 Check File .txt #############
-			LOG_MESSAGE="## File .txt : "${CURRENT_DATA}" ..."
-			FILE_FOR_SQL=${CURRENT_DATA}		
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-		else
-			############# 5.3.2 Check File .dat/.sync #############
-			LOG_MESSAGE="## Check Data : file .sync ..."${CURRENT_DATA}
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			cat ${CURRENT_DATA} > ${TMP_CHK} 
-				 
-			DAT_FILE_NAME=`cat ${CURRENT_DATA}|nawk -F"|" '{print $1}' `
-			SYNC_ROW_SIZE=`cat ${CURRENT_DATA}|nawk -F"|" '{print $2}' `
-			SYNC_DATA=`cat ${CURRENT_DATA} `
-			echo "DAT_FILE_NAME : "${DAT_FILE_NAME}
-			echo "SYNC_ROW_SIZE : "${SYNC_ROW_SIZE}
-			
-			if [ -z ${SYNC_DATA} ]; then
-				JOB_RESULT_FLG="N"
-				JOB_RESULT=3
-				LOG_MESSAGE="No data in file .sync"
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}				
-	            UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-			fi
-				  
-			LOG_MESSAGE="## Check Name File .sync and Data Name file .dat in .sync file"
-			
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			
-			chk_s=${CURRENT_DATA%%.*}
-			chk_d=${DAT_FILE_NAME%%.*}
-			LOG_MESSAGE="Name File .sync : "${chk_s}
-			
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			LOG_MESSAGE="Data Name file .dat in .sync file : "${chk_d}
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			
-		
-			if [ $chk_s == $chk_d ]; then
-				LOG_MESSAGE="Name File .sync == Data Name file .dat in .sync file"	
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			else
-				LOG_MESSAGE="Name File .sync <> Data Name file .dat in .sync file"
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	  
-				JOB_RESULT_FLG="N"
-				JOB_RESULT=3
-				UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"		
-			fi
-			
-			
-			LOG_MESSAGE="## File .sync : Finding ..."${DAT_FILE_NAME}" : Size or Row ..."${SYNC_ROW_SIZE}
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				  
-			##### 5.3.2.1 find .dat #####
-			echo "----------------------------------"$DAT_FILE_NAME
-			
-			ls ${DAT_FILE_NAME} > $LST_CHK
-			row_d=`cat ${LST_CHK} |wc -l|sed 's/ //g'`
-
-			DATA_SOURCE=${DAT_FILE_NAME}
-
-			if [ $row_d -eq 0 ]; then
-				LOG_MESSAGE="File .dat not found."
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-				JOB_RESULT_FLG="N"
-				JOB_RESULT=2
-				UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-			else
-				LOG_MESSAGE="Total list file .dat = "${row_d}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				#echo ${LOG_MESSAGE}
-			fi
-
-			
-			##### 5.3.2.2 Check Row/Size of DAT File #####			
-			if [ $FILE_CHECK == "R" ]; then
-				DAT_ROW_SIZE=`cat ${DAT_FILE_NAME} |wc -l|sed 's/ //g'`
-				DAT_ROW_SIZE=$(($DAT_ROW_SIZE))
-			else
-				DAT_ROW_SIZE=`ls -l ${DAT_FILE_NAME} | awk '{ print $5}'`
-			fi
-			
-			LOG_MESSAGE="File .dat ["${num}"] : "${DAT_FILE_NAME}" | Size or Row : "${DAT_ROW_SIZE}
-			#echo ${LOG_MESSAGE}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			
-			if [ $SYNC_ROW_SIZE -ne $DAT_ROW_SIZE ]; then
-				LOG_MESSAGE="Data file .dat/.sync is wrong row or size."
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}		
-				JOB_RESULT_FLG="N"
-				JOB_RESULT=3
-				UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-			else
-				FILE_FOR_SQL=${DAT_FILE_NAME}	
-                ##UPD_LAST_FILE_NAME=${DAT_FILE_NAME}					
-			fi					
-		fi ###CHK TXT DAT
-
-#######END Validate File JOB_RESULT = 2, 3########
-
-		if [ $DELAY_FLG == "N" ]; then
-			LOG_MESSAGE="CHECK DATE FILE ... "}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-			#DATE_CHECK=$(echo ${FILE_FOR_SQL} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
-                     DATE_CHECK=$(echo ${FILE_FOR_SQL} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')
-			LOG_MESSAGE="DATE_CHECK ... "${DATE_CHECK}
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-	
-			##First row
-			if [ -z "$DATE_COUNT" ];then 
-				if [ $GET_FILE == "F" ]; then
-					DATE_COUNT=$DATE_CHECK
-				else
-					DATE_COUNT=$V_DATEFROM
-				fi
-				
-				if [ $DATE_COUNT == $DATE_CHECK ]; then
-					LOG_MESSAGE="START DATE_COUNT ... "${DATE_COUNT}
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				else
-					LOG_MESSAGE="Some file missing ..."
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			
-					#LOG_MESSAGE="## The File Date : "${DATE_COUNT}" is missing ... "
-					#echo ${LOG_MESSAGE}
-					#echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-
-					JOB_RESULT_FLG="N"				
-					JOB_RESULT=4
-					DATA_SOURCE=$CURRENT_DATA
-					if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
-						V_DATEFROM=$DATE_COUNT
-					fi
-					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-				fi
-			else
-				LOG_MESSAGE="DATE_COUNT ... "${DATE_COUNT}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-			fi
-
-			##RANG FILE 
-			## Command In Loop ##
-			sqlplus -s @${CM_USERID} ${DATE_CHECK} ${DATE_COUNT} > $DATA_TMP_FILE <<EOF
-			set echo off verify off feed off head off line 1000 pages 0
-			SELECT trim(to_date('&&1','yyyymmdd') - to_date('&&2','yyyymmdd'))
-			FROM dual;
-EOF
-
-			COUNT=`cat $DATA_TMP_FILE | awk '{print $1}'`	
-
-			if [ $COUNT -ge 2 ]; then
-				FILE_DATE_FLG="N"	
-				LOG_MESSAGE="##Some file missing ... "
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				## Command In Loop ##
-				sqlplus -s @${CM_USERID} ${PGM_ID} > $TMP_FILE <<EOF
-				set echo off verify off feed off head off line 1000 pages 0
-				SELECT to_char(t.date_count,'yyyymmdd')
-				FROM 
-				(SELECT nvl((SELECT to_date(substr(MAX(data_source), length(p.file_name)+1, 8), 'yyyymmdd') + 1
-											  FROM cm_etl_log
-											  WHERE job_name = p.job_name
-											  AND substr(data_source,-4,4)=p.file_type
-											  AND finish_date IS NOT NULL
-											  ), sysdate) date_count
-						FROM cm_etl_parameter p
-						WHERE p.job_name='&&1')t;
-EOF
-				DATE_COUNT=`cat $TMP_FILE | awk '{print $1}'`
-
-				LOG_MESSAGE="## The File Date : "${DATE_COUNT}" is missing ... "
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			else
-				DATE_COUNT=$DATE_CHECK
-				FILE_DATE_FLG="Y"
-				LOG_MESSAGE="DATE_COUNT ... "${DATE_COUNT}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			fi
-	
-		else
-			FILE_DATE_FLG="Y"
-		fi 
-
-		#check Date Not Pass
-		if [ $FILE_DATE_FLG == "N" ]; then 
-			LOG_MESSAGE="Program : Some file missing ..."
-			echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-			JOB_RESULT_FLG="N"
-			JOB_RESULT=4
-			DATA_SOURCE=$CURRENT_DATA
-			if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
-				V_DATEFROM=$DATE_COUNT
-			fi
-			UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-		else
-			
-			### 5.4 Check Split File before Call PL	
-			if [ $SPLIT_FLG == "Y" ]; then
-				### 5.4.1 IF SPLIT_FLG = Y  ### 
-				LOG_MESSAGE="## SPLIT_FLG = Y .... "
-				echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				
-				### 5.4.1.1 Copy file for backup  ### 
-				LOG_MESSAGE="## Copy File: "${FILE_FOR_SQL}
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				cp ${FILE_FOR_SQL} ${DATA_BK_PATH}
-				LOG_MESSAGE="## Splitting File..."
-			   # echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-
-				ls ${FILE_FOR_SQL} > $TMP_SPLIT
-				rows_split=`cat ${TMP_SPLIT}|wc -l|sed 's/ //g'`
-
-				num_split=1
-				while [ $num_split -le $rows_split ]
-				do
-					tail_row_split="tail +${num_split} ${TMP_SPLIT}"
-					$tail_row_split > $OUT_SPLIT
-
-					filename_split=`head -1 $OUT_SPLIT | cut -f1`
-					LOG_MESSAGE="Split File Name: "${filename_split}
-					echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-
-					split -l ${SPLIT_ROW} ${filename_split} ${filename_split}
-					rm ${filename_split}
-
-					let num_split=$num_split+1
-				done
-
-				### 5.4.1.2 Load File ## 
-				LOG_MESSAGE="## Loading File..."
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-
-				ls ${FILE_FOR_SQL}*|sort > $TMP_SPLIT
-				rows_split=`cat ${TMP_SPLIT}|wc -l|sed 's/ //g'`
-			
-
-				LOG_MESSAGE="Count Splitted File: "${rows_split}
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				
-				##Start Check Rows Split 	
-				if [ $rows_split -eq 0 ]; then
-					LOG_MESSAGE="Splitted file not found."
-					filename_split="NO"
-					JOB_RESULT_FLG="N"
-					JOB_RESULT=2
-					if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ] ; then					    
-						V_DATEFROM=DATE_COUNT		
-					fi
-					if [ $ALL_FILE_FLG_SPILT == "Y" ] && [ $ALL_FILE_FLG == "Y" ]; then
-						ALL_FILE_FLG="Y"
-					else
-						ALL_FILE_FLG="N"
-					fi		
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-					UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-				else 
-					num_split=1
-					while [ $num_split -le $rows_split ]
-					do
-						tail_row_split="tail +${num_split} ${TMP_SPLIT}"
-						$tail_row_split > $OUT_SPLIT
-						filename_split=`head -1 $OUT_SPLIT | cut -f1`
-						if [ $num_split -eq $rows_split ]; then
-						ALL_FILE_FLG_SPILT="Y"
-						else
-						ALL_FILE_FLG_SPILT="N"
-						fi
-						echo "ALL_FILE_FLG_SPILT : "$ALL_FILE_FLG_SPILT
-						echo "ALL_FILE_FLG : "$ALL_FILE_FLG	  
-						### 5.4.1.3 Check Log Datasource
-						if [ $DELAY_FLG == "N" ]; then
-							## Command In Loop ##
-							sqlplus -s @${CM_USERID} ${PGM_ID} ${filename_split} > $FILE_Y <<EOF
-							set echo off verify off feed off head off line 1000 pages 0
-							select 'Y'
-							from cm_etl_log l
-							where l.job_name='&&1'
-							and l.data_source='&&2'
-							and l.finish_date is not null
-							and rownum=1;
-EOF
-							rows_y=`cat ${FILE_Y}|wc -l|sed 's/ //g'`
-							if [ $rows_y -ne 0 ]; then
-								FILE_Y="Y"
-								LOG_MESSAGE="## File : "${filename_split}" is exists in log data source"
-								#echo ${LOG_MESSAGE}
-								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-
-							else
-								FILE_Y="N"
-								LOG_MESSAGE="## File : "${filename_split}" is not exists in log data source"
-								#echo ${LOG_MESSAGE}
-								echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-							fi
-						else
-							FILE_Y="N"
-							LOG_MESSAGE="## This delay case don't check log data source"
-							#echo ${LOG_MESSAGE}
-							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-						fi  ###Check Log Datasource
-						
-						#FILE_Y NOT IN CM_ETL_LOG
-						if [ $FILE_Y == "N" ]; then					
-				
-							### 5.4.1.4 Execut Query ## 			  
-							LOG_MESSAGE="## Execute Query ... ["${num_split}"] : "${filename_split}
-							#echo ${LOG_MESSAGE}
-							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}   
-							  
-							#DATE_FOR_SQL=$(echo ${filename_split} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
-                                                 DATE_FOR_SQL=$(echo ${filename_split}	|awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')						  
-
-##Excute Process.sql In Loop ##
-							sqlplus -s @${CM_USERID} >> ${LOG_PATH}/${LOG_FILE} <<EOF
-							@${SCRIPT_PATH}/${SCRIPT_NAME} ${SPLIT_PATH} ${filename_split} ${DATE_FROM} ${DATE_TO}
-							##${DATE_FOR_SQL}
-EOF
-							RESULT=$?;
-							## 5.4.1.5 Check Result ##
-							DATA_SOURCE=$filename_split
-							###V_DATEFROM=DATE_FROM
-							JOB_RESULT=""
-							ALL_FILE_FLG=""
-							if [ $ALL_FILE_FLG_SPILT == "Y" ] && [ $ALL_FILE_FLG == "Y" ]; then
-								ALL_FILE_FLG="Y"
-							else
-								ALL_FILE_FLG="N"
-							fi
-										
-							if [ $RESULT -eq 16 ]; then
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Execute Error / Data Error : Return ("${RESULT}")"
-								filename_split="NO"
-								JOB_RESULT=5
-							elif [ $RESULT -eq 4 ]; then
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Can not open data file : Return ("${RESULT}")"
-								filename_split="NO"
-								JOB_RESULT=5
-								JOB_RESULT_FLG="N"
-						    ## [4]
-							elif [ $RESULT -eq 8 ]; then
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Conflicted columns did not match with file : Return ("${RESULT}")"
-								filename_split="NO"
-								JOB_RESULT=6
-								JOB_RESULT_FLG="N"		
-							elif [ $RESULT -eq 10 ]; then
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Maintain Log Error : Return ("${RESULT}")"
-								JOB_RESULT=0
-								JOB_RESULT_FLG="Y"
-							elif [ $RESULT -eq 12 ]; then
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Check cm_etl_error : Return ("${RESULT}")"
-								filename_split="NO"
-								JOB_RESULT=0
-								JOB_RESULT_FLG="Y"
-							else
-								LOG_MESSAGE="## "${SCRIPT_NAME}" : Execute Completely : Return ("${RESULT}")"
-								JOB_RESULT=0
-								JOB_RESULT_FLG="Y"
-							fi;  
-							
-							if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
-								if [ $JOB_RESULT -eq 0 ]; then
-									V_DATEFROM=$DATE_CHECK	
-								else
-									V_DATEFROM=$DATE_COUNT
-									
-									UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"
-								fi
-							fi
-							
-							echo ${LOG_MESSAGE}
-							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-										  
-						else
-							LOG_MESSAGE="## Skip file ..."
-							echo ${LOG_MESSAGE}
-							echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-						fi 
-
-						let num_split=$num_split+1 	
-						
-					done 
-				fi
-				##End Check Rows Split 		
-								
-			fi ### END 5.4 Check Split File before Call PL	
-	
-			if [ $SPLIT_FLG == "N" ]; then 	
-				### 5.4.2 IF SPLIT_FLG = N  ###	
-				LOG_MESSAGE="## SPLIT_FLG = N .... "
-				#echo ${LOG_MESSAGE}
-				echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-						
-				### 5.4.2.1 Check Log Datasource
-				if [ $DELAY_FLG == "N" ]; then
-					LOG_MESSAGE="Check Log Datasource ...."
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-					## Command In Loop ##
-					sqlplus -s @${CM_USERID} ${PGM_ID} ${FILE_FOR_SQL} > $FILE_Y <<EOF
-					set echo off verify off feed off head off line 1000 pages 0
-					select 'Y'
-					from cm_etl_log l
-					where l.job_name='&&1'
-					and l.data_source='&&2'
-					and l.finish_date is not null
-					and rownum=1;
-EOF
-					rows_y=`cat ${FILE_Y}|wc -l|sed 's/ //g'`
-
-					if [ $rows_y -ne 0 ]; then
-						FILE_Y="Y"
-						LOG_MESSAGE="## File : "${FILE_FOR_SQL}" is exists in log data source"
-						#echo ${LOG_MESSAGE}
-						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}	
-
-					else
-						FILE_Y="N"
-						LOG_MESSAGE="## File : "${FILE_FOR_SQL}" is not exists in log data source"
-						#echo ${LOG_MESSAGE}
-						echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-					fi
-
-				else
-					FILE_Y="N"
-					LOG_MESSAGE="## This delay case don't check log data source"
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				fi  ###Check Log Datasource
-						
-
-				if [ $FILE_Y == "N" ]; then			
-					### 5.4.2. IF Execute Query ###
-					LOG_MESSAGE="## Execute Query ... ["${num}"] : "${FILE_FOR_SQL}
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}  
-						
-					#DATE_FOR_SQL=$(echo ${FILE_FOR_SQL} | sed -e s/[^0-9]//g | awk '{ printf "%s\n", substr($1,1,8) }')
-                                   DATE_FOR_SQL=$(echo ${FILE_FOR_SQL} |awk '{ printf "%s\n", substr($1,'${POSITION_DATE}',8) }')					## Command In Loop ##
-					sqlplus -s @${CM_USERID} >> ${LOG_PATH}/${LOG_FILE} <<EOF
-					@${SCRIPT_PATH}/${SCRIPT_NAME} ${FILE_PATH} ${FILE_FOR_SQL} ${DATE_FOR_SQL} ${DATE_FOR_SQL}
-					#${DATE_FOR_SQL}
-EOF
-					RESULT=$?;
-					## 5.4.2.2 Check Result ##
-
-					if [ $RESULT -eq 16 ]; then
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Error / Error : Return ("${RESULT}")"
-						JOB_RESULT=5
-						JOB_RESULT_FLG="N"
-					elif [ $RESULT -eq 4 ]; then
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Can not open data file : Return ("${RESULT}")"
-						JOB_RESULT=5
-						JOB_RESULT_FLG="N"	
-					## [4]
-					elif [ $RESULT -eq 8 ]; then
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Conflicted columns did not match with file : Return ("${RESULT}")"
-						JOB_RESULT=6
-						JOB_RESULT_FLG="N"
-					elif [ $RESULT -eq 10 ]; then
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Maintain Log Error : Return ("${RESULT}")"
-						FILE_FOR_SQL="NO"
-						JOB_RESULT=0
-						JOB_RESULT_FLG="Y"
-					elif [ $RESULT -eq 12 ]; then
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Check cm_etl_error : Return ("${RESULT}")"	
-						JOB_RESULT=0
-						JOB_RESULT_FLG="Y"
-					else
-						LOG_MESSAGE="## "${FILE_FOR_SQL}" : Execute Completely : Return ("${RESULT}")"
-						JOB_RESULT=0
-						JOB_RESULT_FLG="Y"	
-					fi; 
-				
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}   
-
-					if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "D" ]; then
-						if [ $RESULT -eq 0 ]; then
-							V_DATEFROM=$DATE_CHECK
-						else
-							V_DATEFROM=$DATE_COUNT
-							UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	
-						fi
-	
-					fi
-							
-
-	
-				else
-					LOG_MESSAGE="## Skip file ..."
-					#echo ${LOG_MESSAGE}
-					echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
-				fi
-					
-			fi  ##SPLIT FLG = N
-fi	
-
-if [ $JOB_RESULT_FLG == "Y" ]; then
-    UPD_LAST_FILE_NAME=${FILE_FOR_SQL}	
-fi  	
- 
-let num=$num+1
-done
 PREV_SUBFOLDER=$SUBFOLDER
 done  
+
+else
+		##FILE_PATH=${MFILE_PATH}/${SUBFOLDER}
+		FILE_PATH=${MFILE_PATH}
+		
+		if [ ! -d "$FILE_PATH" ]; then
+		LOG_MESSAGE="File Path Not found [ $FILE_PATH ]"
+		JOB_RESULT_FLG="N"
+		JOB_RESULT=2
+		#LOG_MESSAGE="Exit Program: "${LOG_MESSAGE}
+		echo ${LOG_MESSAGE}
+		echo ${LOG_MESSAGE} >> $LOG_PATH/${LOG_FILE}
+		
+		if [ $DELAY_FLG == "N" ] && [ $GET_FILE == "F" ]; then
+			LOG_MESSAGE="File Path Not found [ $FILE_PATH ]"
+			JOB_RESULT_FLG="Y"
+			JOB_RESULT=0
+		fi
+		
+		UpdateParameter "$JOB_RESULT_FLG|$V_DATEFROM|$DATE_TO|$JOB_RESULT|$SHORT_KEY|$LOG_MESSAGE|$DATA_SOURCE|$GET_FILE"	                  
+	fi
+		cd ${FILE_PATH}
+		CheckFile
+		
+fi
 
 LOG_MESSAGE="  Exit Program: "${LOG_MESSAGE}
 echo ${LOG_MESSAGE}
